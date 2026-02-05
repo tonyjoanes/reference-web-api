@@ -1,10 +1,12 @@
+using System.ComponentModel.DataAnnotations;
+
 namespace ReferenceWebApi.Configuration;
 
 /// <summary>
 /// Options for connecting to Azure Key Vault.
 /// Bound from the "AzureKeyVault" section.
 /// </summary>
-public class AzureKeyVaultOptions
+public class AzureKeyVaultOptions : IValidatableObject
 {
     public const string SectionName = "AzureKeyVault";
 
@@ -12,6 +14,7 @@ public class AzureKeyVaultOptions
     /// The Key Vault URI (e.g. "https://my-vault.vault.azure.net/").
     /// When empty, Key Vault configuration is skipped.
     /// </summary>
+    [Url(ErrorMessage = "VaultUri must be a valid URL when provided")]
     public string VaultUri { get; set; } = string.Empty;
 
     /// <summary>
@@ -26,4 +29,22 @@ public class AzureKeyVaultOptions
     public TimeSpan CacheExpiration { get; set; } = TimeSpan.FromMinutes(30);
 
     public bool IsConfigured => !string.IsNullOrWhiteSpace(VaultUri);
+
+    public IEnumerable<ValidationResult> Validate(ValidationContext validationContext)
+    {
+        if (CacheExpiration < TimeSpan.FromSeconds(1))
+            yield return new ValidationResult(
+                "CacheExpiration must be at least 1 second",
+                [nameof(CacheExpiration)]);
+
+        if (CacheExpiration > TimeSpan.FromDays(1))
+            yield return new ValidationResult(
+                "CacheExpiration must not exceed 1 day",
+                [nameof(CacheExpiration)]);
+
+        if (IsConfigured && !VaultUri.StartsWith("https://", StringComparison.OrdinalIgnoreCase))
+            yield return new ValidationResult(
+                "VaultUri must use HTTPS",
+                [nameof(VaultUri)]);
+    }
 }

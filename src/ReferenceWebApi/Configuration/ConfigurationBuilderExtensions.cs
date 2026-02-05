@@ -31,7 +31,6 @@ public static class ConfigurationBuilderExtensions
         string environment)
     {
         // ── Step 1 & 2: JSON files (already added by default host builder) ──
-        // We log what was loaded for diagnostic visibility.
         Log.Information("Configuration source [1/7]: appsettings.json");
         Log.Information("Configuration source [2/7]: appsettings.{Environment}.json", environment);
 
@@ -100,31 +99,53 @@ public static class ConfigurationBuilderExtensions
 
             builder.AddAzureAppConfiguration(azureOptions =>
             {
-                azureOptions
-                    .Connect(new Uri(options.Endpoint), credential)
-                    .Select(options.KeyFilter)
-                    .ConfigureRefresh(refresh =>
-                    {
-                        refresh
-                            .Register(options.SentinelKey, refreshAll: true)
-                            .SetCacheExpiration(options.CacheExpiration);
-                    });
+                azureOptions.Connect(new Uri(options.Endpoint), credential);
 
-                // Apply label filter if specified
-                if (!string.IsNullOrWhiteSpace(options.LabelFilter))
+                // Select() is additive. Keys with no label serve as the base;
+                // labelled keys override them for the same key name.
+                if (!string.IsNullOrWhiteSpace(options.KeyFilter))
                 {
-                    azureOptions.Select(options.KeyFilter, options.LabelFilter);
-                    Log.Information(
-                        "  Azure App Config: using label filter '{Label}'", options.LabelFilter);
+                    azureOptions.Select(options.KeyFilter, LabelFilter.Null);
+                    Log.Information("  Azure App Config: selecting '{KeyFilter}' (no label)", options.KeyFilter);
                 }
 
+                if (!string.IsNullOrWhiteSpace(options.LabelFilter))
+                {
+                    var filter = string.IsNullOrWhiteSpace(options.KeyFilter)
+                        ? KeyFilter.Any
+                        : options.KeyFilter;
+                    azureOptions.Select(filter, options.LabelFilter);
+                    Log.Information(
+                        "  Azure App Config: selecting with label '{Label}' (overrides no-label)",
+                        options.LabelFilter);
+                }
+
+                azureOptions.ConfigureRefresh(refresh =>
+                {
+                    refresh
+                        .Register(options.SentinelKey, refreshAll: true)
+                        .SetCacheExpiration(options.CacheExpiration);
+                });
+
                 Log.Information(
-                    "  Azure App Config: key filter = '{KeyFilter}', sentinel = '{Sentinel}', " +
-                    "cache expiration = {CacheExpiration}",
-                    options.KeyFilter, options.SentinelKey, options.CacheExpiration);
+                    "  Azure App Config: sentinel = '{Sentinel}', cache = {CacheExpiration}",
+                    options.SentinelKey, options.CacheExpiration);
             });
 
             Log.Information("  Azure App Configuration connected successfully");
+        }
+        catch (UriFormatException ex)
+        {
+            Log.Error(ex,
+                "Configuration source [4/7]: Azure App Configuration — invalid endpoint URI '{Endpoint}'",
+                options.Endpoint);
+        }
+        catch (AuthenticationFailedException ex)
+        {
+            Log.Error(ex,
+                "Configuration source [4/7]: Azure App Configuration — authentication failed for {Endpoint}. " +
+                "Verify DefaultAzureCredential is configured. Error: {Error}",
+                options.Endpoint, ex.Message);
         }
         catch (Exception ex)
         {
@@ -168,9 +189,22 @@ public static class ConfigurationBuilderExtensions
                 new PrefixKeyVaultSecretManager(options.SecretPrefix));
 
             Log.Information(
-                "  Key Vault: prefix = '{Prefix}', cache expiration = {CacheExpiration}",
+                "  Key Vault: prefix = '{Prefix}', cache = {CacheExpiration}",
                 options.SecretPrefix, options.CacheExpiration);
             Log.Information("  Azure Key Vault connected successfully");
+        }
+        catch (UriFormatException ex)
+        {
+            Log.Error(ex,
+                "Configuration source [5/7]: Azure Key Vault — invalid vault URI '{VaultUri}'",
+                options.VaultUri);
+        }
+        catch (AuthenticationFailedException ex)
+        {
+            Log.Error(ex,
+                "Configuration source [5/7]: Azure Key Vault — authentication failed for {VaultUri}. " +
+                "Verify DefaultAzureCredential is configured. Error: {Error}",
+                options.VaultUri, ex.Message);
         }
         catch (Exception ex)
         {

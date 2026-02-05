@@ -1,3 +1,4 @@
+using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.Extensions.Options;
 using ReferenceWebApi.Configuration;
@@ -6,7 +7,8 @@ namespace ReferenceWebApi.Controllers;
 
 /// <summary>
 /// Diagnostic endpoints for inspecting the running configuration.
-/// In production, protect these endpoints with authorization.
+/// Restricted to Development environment only — returns 404 in Production
+/// so the endpoint doesn't even appear to exist.
 /// </summary>
 [ApiController]
 [Route("[controller]")]
@@ -15,17 +17,17 @@ public class DiagnosticsController : ControllerBase
     private readonly IConfiguration _configuration;
     private readonly IWebHostEnvironment _environment;
     private readonly ILogger<DiagnosticsController> _logger;
-    private readonly IOptions<ApiOptions> _apiOptions;
-    private readonly IOptions<AzureAppConfigurationOptions> _appConfigOptions;
-    private readonly IOptions<AzureKeyVaultOptions> _keyVaultOptions;
+    private readonly IOptionsSnapshot<ApiOptions> _apiOptions;
+    private readonly IOptionsSnapshot<AzureAppConfigurationOptions> _appConfigOptions;
+    private readonly IOptionsSnapshot<AzureKeyVaultOptions> _keyVaultOptions;
 
     public DiagnosticsController(
         IConfiguration configuration,
         IWebHostEnvironment environment,
         ILogger<DiagnosticsController> logger,
-        IOptions<ApiOptions> apiOptions,
-        IOptions<AzureAppConfigurationOptions> appConfigOptions,
-        IOptions<AzureKeyVaultOptions> keyVaultOptions)
+        IOptionsSnapshot<ApiOptions> apiOptions,
+        IOptionsSnapshot<AzureAppConfigurationOptions> appConfigOptions,
+        IOptionsSnapshot<AzureKeyVaultOptions> keyVaultOptions)
     {
         _configuration = configuration;
         _environment = environment;
@@ -38,11 +40,16 @@ public class DiagnosticsController : ControllerBase
     /// <summary>
     /// Returns the list of configuration providers in precedence order,
     /// and reports which Azure services are connected.
-    /// Does NOT expose any configuration values.
+    /// Does NOT expose any configuration values — only provider types and
+    /// connection metadata.
+    /// Only available in Development.
     /// </summary>
     [HttpGet("config/providers")]
     public IActionResult GetConfigurationProviders()
     {
+        if (!_environment.IsDevelopment())
+            return NotFound();
+
         _logger.LogInformation("Diagnostics: listing configuration providers");
 
         var providers = new List<object>();
@@ -69,7 +76,7 @@ public class DiagnosticsController : ControllerBase
             AzureAppConfiguration = new
             {
                 _appConfigOptions.Value.IsConfigured,
-                _appConfigOptions.Value.Endpoint,
+                Endpoint = MaskUri(_appConfigOptions.Value.Endpoint),
                 _appConfigOptions.Value.KeyFilter,
                 _appConfigOptions.Value.SentinelKey,
                 _appConfigOptions.Value.CacheExpiration,
@@ -77,7 +84,7 @@ public class DiagnosticsController : ControllerBase
             AzureKeyVault = new
             {
                 _keyVaultOptions.Value.IsConfigured,
-                _keyVaultOptions.Value.VaultUri,
+                VaultUri = MaskUri(_keyVaultOptions.Value.VaultUri),
                 _keyVaultOptions.Value.SecretPrefix,
                 _keyVaultOptions.Value.CacheExpiration,
             },
@@ -87,12 +94,14 @@ public class DiagnosticsController : ControllerBase
 
     /// <summary>
     /// Lists the configuration keys (not values) to help diagnose
-    /// which settings are present. Safe to call in non-production
-    /// environments; in production, add authorization.
+    /// which settings are present. Only available in Development.
     /// </summary>
     [HttpGet("config/keys")]
     public IActionResult GetConfigurationKeys([FromQuery] string? prefix)
     {
+        if (!_environment.IsDevelopment())
+            return NotFound();
+
         _logger.LogInformation("Diagnostics: listing configuration keys with prefix '{Prefix}'", prefix ?? "(all)");
 
         var children = string.IsNullOrWhiteSpace(prefix)
@@ -110,5 +119,19 @@ public class DiagnosticsController : ControllerBase
             Count = keys.Count,
             Keys = keys,
         });
+    }
+
+    /// <summary>
+    /// Masks a URI to show only the host, hiding the full path and query.
+    /// </summary>
+    private static string MaskUri(string uri)
+    {
+        if (string.IsNullOrWhiteSpace(uri))
+            return "(not configured)";
+
+        if (Uri.TryCreate(uri, UriKind.Absolute, out var parsed))
+            return $"{parsed.Scheme}://{parsed.Host}/***";
+
+        return "(invalid URI)";
     }
 }
