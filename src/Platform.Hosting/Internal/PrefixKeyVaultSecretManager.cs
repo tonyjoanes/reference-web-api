@@ -1,18 +1,18 @@
 using Azure.Extensions.AspNetCore.Configuration.Secrets;
 using Azure.Security.KeyVault.Secrets;
 
-namespace ReferenceWebApi.Configuration;
+namespace Platform.Hosting.Internal;
 
 /// <summary>
 /// Maps Key Vault secrets to configuration keys using an optional prefix.
 ///
 /// Secrets are named with double dashes as separators (Key Vault doesn't allow colons).
-/// For example, the secret "ReferenceWebApi--ConnectionStrings--DefaultDb" maps to
-/// the configuration key "ConnectionStrings:DefaultDb" when the prefix is "ReferenceWebApi".
+/// For example, the secret "MyService--ConnectionStrings--Sql" maps to
+/// the configuration key "ConnectionStrings:Sql" when the prefix is "MyService".
 ///
 /// Secrets that don't start with the prefix are ignored.
 /// </summary>
-public class PrefixKeyVaultSecretManager : KeyVaultSecretManager
+internal class PrefixKeyVaultSecretManager : KeyVaultSecretManager
 {
     private readonly string _prefix;
 

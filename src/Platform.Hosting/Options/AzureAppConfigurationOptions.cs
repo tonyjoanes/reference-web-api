@@ -1,10 +1,10 @@
 using System.ComponentModel.DataAnnotations;
 
-namespace ReferenceWebApi.Configuration;
+namespace Platform.Hosting.Options;
 
 /// <summary>
 /// Options for connecting to Azure App Configuration.
-/// Bound from the "AzureAppConfiguration" section.
+/// Bound from the "AzureAppConfiguration" configuration section.
 /// </summary>
 public class AzureAppConfigurationOptions : IValidatableObject
 {
@@ -22,7 +22,7 @@ public class AzureAppConfigurationOptions : IValidatableObject
     /// When this key's value changes, all configuration is reloaded.
     /// </summary>
     [Required(AllowEmptyStrings = false)]
-    public string SentinelKey { get; set; } = "ReferenceWebApi:Sentinel";
+    public string SentinelKey { get; set; } = string.Empty;
 
     /// <summary>
     /// How long configuration values are cached before checking for updates.
@@ -30,7 +30,7 @@ public class AzureAppConfigurationOptions : IValidatableObject
     public TimeSpan CacheExpiration { get; set; } = TimeSpan.FromMinutes(5);
 
     /// <summary>
-    /// Filter to select which keys to load (e.g. "ReferenceWebApi:*").
+    /// Filter to select which keys to load (e.g. "MyService:*").
     /// </summary>
     public string KeyFilter { get; set; } = string.Empty;
 

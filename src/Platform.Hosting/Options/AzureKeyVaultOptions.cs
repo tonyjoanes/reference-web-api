@@ -1,10 +1,10 @@
 using System.ComponentModel.DataAnnotations;
 
-namespace ReferenceWebApi.Configuration;
+namespace Platform.Hosting.Options;
 
 /// <summary>
 /// Options for connecting to Azure Key Vault.
-/// Bound from the "AzureKeyVault" section.
+/// Bound from the "AzureKeyVault" configuration section.
 /// </summary>
 public class AzureKeyVaultOptions : IValidatableObject
 {

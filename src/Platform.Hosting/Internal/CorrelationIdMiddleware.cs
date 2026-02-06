@@ -1,4 +1,7 @@
-namespace ReferenceWebApi.Middleware;
+using Microsoft.AspNetCore.Http;
+using Microsoft.Extensions.Logging;
+
+namespace Platform.Hosting.Internal;
 
 /// <summary>
 /// Propagates or generates a correlation ID for every request.
@@ -7,9 +10,10 @@ namespace ReferenceWebApi.Middleware;
 /// The value is placed on the response header and into the Serilog
 /// LogContext so every log line within the request is correlated.
 /// </summary>
-public class CorrelationIdMiddleware
+internal class CorrelationIdMiddleware
 {
     public const string HeaderName = "X-Correlation-ID";
+    public const string ItemKey = "CorrelationId";
 
     private readonly RequestDelegate _next;
     private readonly ILogger<CorrelationIdMiddleware> _logger;
@@ -25,7 +29,7 @@ public class CorrelationIdMiddleware
         var correlationId = context.Request.Headers[HeaderName].FirstOrDefault()
                             ?? Guid.NewGuid().ToString("D");
 
-        context.Items["CorrelationId"] = correlationId;
+        context.Items[ItemKey] = correlationId;
         context.Response.OnStarting(() =>
         {
             context.Response.Headers[HeaderName] = correlationId;
@@ -33,7 +37,7 @@ public class CorrelationIdMiddleware
         });
 
         // Push into Serilog LogContext so every log line includes it
-        using (Serilog.Context.LogContext.PushProperty("CorrelationId", correlationId))
+        using (Serilog.Context.LogContext.PushProperty(ItemKey, correlationId))
         {
             _logger.LogDebug("Request correlated as {CorrelationId}", correlationId);
             await _next(context);

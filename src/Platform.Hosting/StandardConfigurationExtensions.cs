@@ -1,40 +1,137 @@
 using Azure.Identity;
+using Microsoft.AspNetCore.Builder;
+using Microsoft.AspNetCore.Hosting;
+using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.Configuration.AzureAppConfiguration;
+using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Hosting;
+using Platform.Hosting.Internal;
+using Platform.Hosting.Options;
 using Serilog;
 
-namespace ReferenceWebApi.Configuration;
+namespace Platform.Hosting;
 
 /// <summary>
-/// Extension methods for building configuration with Azure App Configuration
-/// and Azure Key Vault, with diagnostic logging at each step.
+/// Opinionated extension methods that configure a WebApplicationBuilder
+/// with the organisation's standard configuration sources, Serilog,
+/// options validation, and health checks.
+///
+/// <para>
+/// Configuration sources are loaded in a fixed order of precedence (last wins):
+/// </para>
+///
+/// <list type="number">
+///   <item><description>appsettings.json (base defaults)</description></item>
+///   <item><description>appsettings.{Environment}.json (environment overrides)</description></item>
+///   <item><description>User secrets (Development only)</description></item>
+///   <item><description>Azure App Configuration (centralised config)</description></item>
+///   <item><description>Azure Key Vault (secrets)</description></item>
+///   <item><description>Environment variables (deployment overrides)</description></item>
+///   <item><description>Command-line arguments (ad-hoc overrides)</description></item>
+/// </list>
+///
+/// <para>
+/// This ordering is enforced by the library and cannot be changed by
+/// consuming services. This prevents the class of bug where "it works on
+/// my machine" because one service loads env vars before Key Vault and
+/// another does the opposite.
+/// </para>
 /// </summary>
-public static class ConfigurationBuilderExtensions
+public static class StandardConfigurationExtensions
 {
     /// <summary>
-    /// Adds all configuration sources in the correct order of precedence:
-    ///
-    ///   1. appsettings.json                  (base defaults)
-    ///   2. appsettings.{Environment}.json    (environment overrides)
-    ///   3. User secrets                       (Development only)
-    ///   4. Azure App Configuration            (centralised config)
-    ///   5. Azure Key Vault                    (secrets)
-    ///   6. Environment variables              (deployment overrides)
-    ///   7. Command-line arguments             (ad-hoc overrides)
-    ///
-    /// Later sources override earlier ones. This means a value in Key Vault
-    /// overrides the same key from App Configuration, which overrides
-    /// appsettings.json, etc.
+    /// Configures the standard configuration pipeline, Serilog, options
+    /// validation, and health checks. Call this once in Program.cs.
     /// </summary>
-    public static IConfigurationBuilder AddConfigurationSources(
-        this IConfigurationBuilder builder,
+    /// <param name="builder">The WebApplicationBuilder from CreateBuilder().</param>
+    /// <param name="args">Command-line arguments (pass through from Main).</param>
+    /// <returns>The same builder, for chaining.</returns>
+    public static WebApplicationBuilder AddStandardConfiguration(
+        this WebApplicationBuilder builder,
+        string[] args)
+    {
+        var environment = builder.Environment.EnvironmentName;
+
+        // ── Configuration sources ────────────────────────────────────────
+        AddConfigurationSources(builder.Configuration, args, environment);
+
+        // ── Serilog ──────────────────────────────────────────────────────
+        builder.Host.UseSerilog((context, services, loggerConfig) =>
+        {
+            loggerConfig.ReadFrom.Configuration(context.Configuration);
+            Log.Information("Serilog reconfigured from full configuration pipeline");
+        });
+
+        // ── Options with validation ──────────────────────────────────────
+        builder.Services
+            .AddOptions<AzureAppConfigurationOptions>()
+            .BindConfiguration(AzureAppConfigurationOptions.SectionName)
+            .ValidateDataAnnotations()
+            .ValidateOnStart();
+
+        builder.Services
+            .AddOptions<AzureKeyVaultOptions>()
+            .BindConfiguration(AzureKeyVaultOptions.SectionName)
+            .ValidateDataAnnotations()
+            .ValidateOnStart();
+
+        // ── Azure App Config refresh middleware service ───────────────────
+        var appConfigOptions = new AzureAppConfigurationOptions();
+        builder.Configuration
+            .GetSection(AzureAppConfigurationOptions.SectionName)
+            .Bind(appConfigOptions);
+
+        if (appConfigOptions.IsConfigured)
+        {
+            builder.Services.AddAzureAppConfiguration();
+        }
+
+        // ── Problem Details (RFC 7807) ───────────────────────────────────
+        builder.Services.AddProblemDetails(options =>
+        {
+            options.CustomizeProblemDetails = context =>
+            {
+                context.ProblemDetails.Extensions["correlationId"] =
+                    context.HttpContext.Items[CorrelationIdMiddleware.ItemKey]?.ToString();
+            };
+        });
+
+        // ── Health checks ────────────────────────────────────────────────
+        var healthChecks = builder.Services.AddHealthChecks();
+
+        var kvOptions = new AzureKeyVaultOptions();
+        builder.Configuration
+            .GetSection(AzureKeyVaultOptions.SectionName)
+            .Bind(kvOptions);
+
+        if (kvOptions.IsConfigured)
+        {
+            healthChecks.AddAzureKeyVault(
+                new Uri(kvOptions.VaultUri),
+                new DefaultAzureCredential(),
+                options => { options.AddSecret("health-check-probe"); },
+                name: "azure-key-vault",
+                tags: ["azure", "secrets"]);
+            Log.Information("Health check registered: Azure Key Vault ({VaultUri})", kvOptions.VaultUri);
+        }
+
+        return builder;
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // Private: configuration source ordering (the whole point of this lib)
+    // ─────────────────────────────────────────────────────────────────────
+
+    private static void AddConfigurationSources(
+        IConfigurationBuilder builder,
         string[] args,
         string environment)
     {
-        // ── Step 1 & 2: JSON files (already added by default host builder) ──
+        // Steps 1–3 (appsettings.json, appsettings.{env}.json, user secrets)
+        // are already added by WebApplication.CreateBuilder(). We log them.
         Log.Information("Configuration source [1/7]: appsettings.json");
         Log.Information("Configuration source [2/7]: appsettings.{Environment}.json", environment);
 
-        // ── Step 3: User secrets (Development only) ──
         if (string.Equals(environment, Environments.Development, StringComparison.OrdinalIgnoreCase))
         {
             Log.Information("Configuration source [3/7]: User secrets (Development)");
@@ -44,21 +141,21 @@ public static class ConfigurationBuilderExtensions
             Log.Debug("Configuration source [3/7]: User secrets — skipped (not Development)");
         }
 
-        // Build an intermediate configuration so we can read Azure connection
-        // settings from appsettings / env vars before adding Azure sources.
+        // Build intermediate config so we can read Azure settings from
+        // appsettings / env vars before adding the Azure sources.
         var intermediateConfig = builder.Build();
 
-        // ── Step 4: Azure App Configuration ──
-        builder.AddAzureAppConfiguration(intermediateConfig, environment);
+        // Step 4: Azure App Configuration
+        AddAzureAppConfiguration(builder, intermediateConfig, environment);
 
-        // ── Step 5: Azure Key Vault ──
-        builder.AddAzureKeyVault(intermediateConfig);
+        // Step 5: Azure Key Vault
+        AddAzureKeyVault(builder, intermediateConfig);
 
-        // ── Step 6: Environment variables ──
+        // Step 6: Environment variables
         builder.AddEnvironmentVariables();
         Log.Information("Configuration source [6/7]: Environment variables");
 
-        // ── Step 7: Command-line arguments ──
+        // Step 7: Command-line arguments
         if (args.Length > 0)
         {
             builder.AddCommandLine(args);
@@ -68,12 +165,10 @@ public static class ConfigurationBuilderExtensions
         {
             Log.Debug("Configuration source [7/7]: Command-line arguments — none provided");
         }
-
-        return builder;
     }
 
-    private static IConfigurationBuilder AddAzureAppConfiguration(
-        this IConfigurationBuilder builder,
+    private static void AddAzureAppConfiguration(
+        IConfigurationBuilder builder,
         IConfiguration intermediateConfig,
         string environment)
     {
@@ -86,7 +181,7 @@ public static class ConfigurationBuilderExtensions
                 "Configuration source [4/7]: Azure App Configuration — skipped " +
                 "(no endpoint configured). Set {Section}:{Key} to enable",
                 AzureAppConfigurationOptions.SectionName, nameof(AzureAppConfigurationOptions.Endpoint));
-            return builder;
+            return;
         }
 
         Log.Information(
@@ -154,12 +249,10 @@ public static class ConfigurationBuilderExtensions
                 "The application will continue without it. Error: {Error}",
                 options.Endpoint, ex.Message);
         }
-
-        return builder;
     }
 
-    private static IConfigurationBuilder AddAzureKeyVault(
-        this IConfigurationBuilder builder,
+    private static void AddAzureKeyVault(
+        IConfigurationBuilder builder,
         IConfiguration intermediateConfig)
     {
         var options = new AzureKeyVaultOptions();
@@ -171,7 +264,7 @@ public static class ConfigurationBuilderExtensions
                 "Configuration source [5/7]: Azure Key Vault — skipped " +
                 "(no vault URI configured). Set {Section}:{Key} to enable",
                 AzureKeyVaultOptions.SectionName, nameof(AzureKeyVaultOptions.VaultUri));
-            return builder;
+            return;
         }
 
         Log.Information(
@@ -213,7 +306,5 @@ public static class ConfigurationBuilderExtensions
                 "The application will continue without it. Error: {Error}",
                 options.VaultUri, ex.Message);
         }
-
-        return builder;
     }
 }
