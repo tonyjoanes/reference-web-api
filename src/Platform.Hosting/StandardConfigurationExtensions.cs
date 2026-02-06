@@ -4,7 +4,11 @@ using Microsoft.AspNetCore.Hosting;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.Configuration.AzureAppConfiguration;
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Diagnostics.HealthChecks;
 using Microsoft.Extensions.Hosting;
+using OpenTelemetry.Metrics;
+using OpenTelemetry.Resources;
+using OpenTelemetry.Trace;
 using Platform.Hosting.Internal;
 using Platform.Hosting.Options;
 using Serilog;
@@ -62,6 +66,21 @@ public static class StandardConfigurationExtensions
             Log.Information("Serilog reconfigured from full configuration pipeline");
         });
 
+        // ── Service metadata (required — forces every service to identify itself) ──
+        builder.Services
+            .AddOptions<ServiceMetadataOptions>()
+            .BindConfiguration(ServiceMetadataOptions.SectionName)
+            .ValidateDataAnnotations()
+            .ValidateOnStart();
+
+        var serviceMetadata = new ServiceMetadataOptions();
+        builder.Configuration
+            .GetSection(ServiceMetadataOptions.SectionName)
+            .Bind(serviceMetadata);
+
+        Log.Information("Service: {Name} v{Version} (team: {Team})",
+            serviceMetadata.Name, serviceMetadata.Version, serviceMetadata.Team);
+
         // ── Options with validation ──────────────────────────────────────
         builder.Services
             .AddOptions<AzureAppConfigurationOptions>()
@@ -111,9 +130,55 @@ public static class StandardConfigurationExtensions
                 new DefaultAzureCredential(),
                 options => { options.AddSecret("health-check-probe"); },
                 name: "azure-key-vault",
-                tags: ["azure", "secrets"]);
+                tags: ["azure", "secrets", "ready"]);
             Log.Information("Health check registered: Azure Key Vault ({VaultUri})", kvOptions.VaultUri);
         }
+
+        // Always register a self-check for liveness (proves the process is alive)
+        healthChecks.AddCheck("self", () => HealthCheckResult.Healthy(), tags: ["live"]);
+
+        // ── OpenTelemetry — distributed tracing and metrics ──────────────
+        var serviceName = string.IsNullOrWhiteSpace(serviceMetadata.Name)
+            ? "unknown-service"
+            : serviceMetadata.Name;
+
+        builder.Services.AddOpenTelemetry()
+            .ConfigureResource(resource =>
+            {
+                resource.AddService(
+                    serviceName: serviceName,
+                    serviceVersion: serviceMetadata.Version);
+                resource.AddAttributes([
+                    new("service.team", serviceMetadata.Team),
+                    new("deployment.environment", environment),
+                ]);
+            })
+            .WithTracing(tracing =>
+            {
+                tracing
+                    .AddAspNetCoreInstrumentation()
+                    .AddHttpClientInstrumentation();
+
+                // Export to OTLP collector if configured via standard env var
+                // OTEL_EXPORTER_OTLP_ENDPOINT (e.g. "http://otel-collector:4317")
+                tracing.AddOtlpExporter();
+
+                Log.Information("OpenTelemetry tracing configured for '{ServiceName}'", serviceName);
+            })
+            .WithMetrics(metrics =>
+            {
+                metrics
+                    .AddAspNetCoreInstrumentation()
+                    .AddHttpClientInstrumentation()
+                    .AddRuntimeInstrumentation();
+
+                metrics.AddOtlpExporter();
+
+                Log.Information("OpenTelemetry metrics configured for '{ServiceName}'", serviceName);
+            });
+
+        // ── HttpContextAccessor (needed by CorrelationId propagation) ────
+        builder.Services.AddHttpContextAccessor();
 
         return builder;
     }

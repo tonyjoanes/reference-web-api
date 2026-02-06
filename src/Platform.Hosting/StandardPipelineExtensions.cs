@@ -1,10 +1,13 @@
 using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Diagnostics;
+using Microsoft.AspNetCore.Diagnostics.HealthChecks;
 using Microsoft.AspNetCore.Hosting;
 using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.Extensions.Configuration;
+using Microsoft.Extensions.Diagnostics.HealthChecks;
 using Microsoft.Extensions.Hosting;
+using Platform.Hosting.Exceptions;
 using Platform.Hosting.Internal;
 using Platform.Hosting.Options;
 using Serilog;
@@ -31,13 +34,15 @@ namespace Platform.Hosting;
 /// <para>
 /// After calling <see cref="UseStandardPipeline"/>, the consuming service
 /// adds its own middleware (Swagger, auth, routing, endpoints, etc.).
+/// Health check endpoints are also mapped automatically:
+/// <c>/healthz/live</c> (liveness) and <c>/healthz/ready</c> (readiness).
 /// </para>
 /// </summary>
 public static class StandardPipelineExtensions
 {
     /// <summary>
-    /// Adds the standard middleware pipeline. Call this before mapping
-    /// your own endpoints or adding app-specific middleware.
+    /// Adds the standard middleware pipeline and maps health check endpoints.
+    /// Call this before mapping your own endpoints or adding app-specific middleware.
     /// </summary>
     /// <returns>The same app, for chaining.</returns>
     public static WebApplication UseStandardPipeline(this WebApplication app)
@@ -46,6 +51,7 @@ public static class StandardPipelineExtensions
 
         // 1. Global exception handler — returns RFC 7807 Problem Details.
         //    Must be first so it wraps everything below.
+        //    PlatformException subclasses map to their declared HTTP status code.
         app.UseExceptionHandler(exceptionApp =>
         {
             exceptionApp.Run(async context =>
@@ -53,24 +59,55 @@ public static class StandardPipelineExtensions
                 context.Response.ContentType = "application/problem+json";
 
                 var exceptionFeature = context.Features.Get<IExceptionHandlerFeature>();
+                var error = exceptionFeature?.Error;
                 var correlationId = context.Items[CorrelationIdMiddleware.ItemKey]?.ToString();
 
-                Log.Error(exceptionFeature?.Error,
-                    "Unhandled exception for {Method} {Path} (CorrelationId: {CorrelationId})",
-                    context.Request.Method, context.Request.Path, correlationId);
+                // PlatformException → use its declared status code and title
+                // Everything else → 500 Internal Server Error
+                var (statusCode, title, detail) = error switch
+                {
+                    PlatformException pe => (
+                        pe.StatusCode,
+                        pe.Title,
+                        pe.Message),
+                    _ => (
+                        StatusCodes.Status500InternalServerError,
+                        "An unexpected error occurred",
+                        app.Environment.IsDevelopment()
+                            ? error?.Message ?? "Unknown error"
+                            : "An internal error occurred. Use the correlation ID to find details in application logs.")
+                };
+
+                // Log at appropriate level: 4xx = Warning, 5xx = Error
+                if (statusCode >= 500)
+                {
+                    Log.Error(error,
+                        "Unhandled exception for {Method} {Path} (CorrelationId: {CorrelationId})",
+                        context.Request.Method, context.Request.Path, correlationId);
+                }
+                else
+                {
+                    Log.Warning(error,
+                        "{Title} for {Method} {Path} (CorrelationId: {CorrelationId}): {Detail}",
+                        title, context.Request.Method, context.Request.Path, correlationId, detail);
+                }
 
                 var problem = new ProblemDetails
                 {
-                    Status = StatusCodes.Status500InternalServerError,
-                    Title = "An unexpected error occurred",
-                    Detail = app.Environment.IsDevelopment()
-                        ? exceptionFeature?.Error?.Message
-                        : "An internal error occurred. Use the correlation ID to find details in application logs.",
+                    Status = statusCode,
+                    Title = title,
+                    Detail = detail,
                     Instance = context.Request.Path,
                 };
                 problem.Extensions["correlationId"] = correlationId;
 
-                context.Response.StatusCode = problem.Status.Value;
+                // Add downstream service info for Bad Gateway errors
+                if (error is BadGatewayException bgEx)
+                {
+                    problem.Extensions["downstreamService"] = bgEx.DownstreamService;
+                }
+
+                context.Response.StatusCode = statusCode;
                 await context.Response.WriteAsJsonAsync(problem);
             });
         });
@@ -120,7 +157,48 @@ public static class StandardPipelineExtensions
             app.UseAzureAppConfiguration();
         }
 
+        // ── Health check endpoints ───────────────────────────────────────
+        // /healthz/live  → liveness:  is the process alive? (k8s livenessProbe)
+        //                   If this fails, k8s restarts the pod.
+        //                   Only checks the "self" check — no dependencies.
+        //
+        // /healthz/ready → readiness: can this instance serve traffic? (k8s readinessProbe)
+        //                   If this fails, k8s removes the pod from the load balancer.
+        //                   Checks dependencies (Key Vault, databases, etc.).
+        app.MapHealthChecks("/healthz/live", new HealthCheckOptions
+        {
+            Predicate = check => check.Tags.Contains("live"),
+            ResponseWriter = WriteHealthResponse,
+        });
+
+        app.MapHealthChecks("/healthz/ready", new HealthCheckOptions
+        {
+            Predicate = check => check.Tags.Contains("ready"),
+            ResponseWriter = WriteHealthResponse,
+        });
+
         return app;
+    }
+
+    private static async Task WriteHealthResponse(HttpContext context, HealthReport report)
+    {
+        context.Response.ContentType = "application/json";
+
+        var result = new
+        {
+            status = report.Status.ToString(),
+            duration = report.TotalDuration.ToString(),
+            checks = report.Entries.Select(e => new
+            {
+                name = e.Key,
+                status = e.Value.Status.ToString(),
+                duration = e.Value.Duration.ToString(),
+                description = e.Value.Description,
+                exception = e.Value.Exception?.Message,
+            }),
+        };
+
+        await context.Response.WriteAsJsonAsync(result);
     }
 
     /// <summary>

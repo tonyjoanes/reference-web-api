@@ -58,7 +58,6 @@ try
 
     app.UseAuthorization();
     app.MapControllers();
-    app.MapHealthChecks("/healthz");
 
     Log.Information("Reference Web API is ready — listening for requests");
     app.Run();
